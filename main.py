@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import cloudinary
@@ -7,7 +9,9 @@ import cloudinary.api
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 from tinydb import Query, TinyDB
+from urllib3.util.retry import Retry
 
 load_dotenv(".env")
 
@@ -16,6 +20,10 @@ class CScrapper:
     def __init__(self) -> None:
         self.cloudName = os.getenv("CLOUD_NAME")
         self.scheduler = BlockingScheduler()
+        self.download_workers = max(1, int(os.getenv("DOWNLOAD_WORKERS", "8")))
+        self.chunk_size = int(os.getenv("DOWNLOAD_CHUNK_SIZE", str(64 * 1024)))
+        self.timeout = int(os.getenv("DOWNLOAD_TIMEOUT", "30"))
+        self._thread_local = threading.local()
         try:
             self.cloud = cloudinary.config(
                 cloud_name=self.cloudName,
@@ -32,6 +40,30 @@ class CScrapper:
         except KeyError as e:
             raise ValueError("Missing environment variable: {}".format(e))
 
+    def _create_session(self):
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=self.download_workers,
+            pool_maxsize=self.download_workers,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _get_session(self):
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = self._create_session()
+            self._thread_local.session = session
+        return session
+
     def extract_datetime(self, error_message):
         match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC", error_message)
         if match:
@@ -39,6 +71,37 @@ class CScrapper:
             execution_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             return execution_time
         return None
+
+    def _sanitize_relative_folder(self, folder):
+        normalized_folder = (folder or "").replace("\\", "/").strip("/")
+        if not normalized_folder:
+            return ""
+
+        safe_parts = []
+        for part in normalized_folder.split("/"):
+            if not part or part == ".":
+                continue
+            if part == "..":
+                raise ValueError(f"Invalid folder path: {folder}")
+            safe_parts.append(part)
+        return os.path.join(*safe_parts) if safe_parts else ""
+
+    def _resource_folder(self, resource):
+        resource_folder = resource.get("folder") or os.path.dirname(resource.get("public_id", ""))
+        return self._sanitize_relative_folder(resource_folder)
+
+    def _resource_extension(self, resource):
+        extension = resource.get("format")
+        if extension:
+            return extension
+        return resource.get("resource_type", "bin")
+
+    def _resource_file_path(self, resource, download_path):
+        folder = self._resource_folder(resource)
+        file_name = f"{resource['asset_id']}.{self._resource_extension(resource)}"
+        if folder:
+            return os.path.join(download_path, folder, file_name), file_name
+        return os.path.join(download_path, file_name), file_name
 
     def schedule_next_run(self):
         if self.next_run["run_at"]:
@@ -89,39 +152,81 @@ class CScrapper:
                 break
 
         self.download_resource()
+        self.all_resources = []
+        self.next_run = {
+            "last_cursor": None,
+            "run_at": None,
+            "page": 1
+        }
+
+    def _download_resource_file(self, resource, download_path):
+        file_path, file_name = self._resource_file_path(resource, download_path)
+        expected_size = resource.get("bytes")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        if os.path.exists(file_path) and expected_size and os.path.getsize(file_path) == expected_size:
+            return "skipped", file_name, file_path
+
+        session = self._get_session()
+        response = None
+        try:
+            response = session.get(resource["secure_url"], stream=True, timeout=self.timeout)
+            response.raise_for_status()
+
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(self.chunk_size):
+                    if chunk:
+                        f.write(chunk)
+
+            return "downloaded", file_name, file_path
+        except requests.RequestException as e:
+            return "failed", file_name, f"Network error: {e}"
+        except IOError as e:
+            return "failed", file_name, f"File error: {e}"
+        except Exception as e:
+            return "failed", file_name, f"{type(e).__name__}: {e}"
+        finally:
+            if response is not None:
+                response.close()
 
     def download_resource(self):
         print("📥 Downloading resources...")
-        chunk_size = 1024
         download_path = os.path.join("downloads", self.cloudName)
         os.makedirs(download_path, exist_ok=True)
+        total_resources = len(self.all_resources)
+        if total_resources == 0:
+            print("ℹ️ No resources to download.")
+            return
 
-        for resource in self.all_resources:
-            url = resource["secure_url"]
-            folder = os.path.normpath(resource["folder"])
-            if folder.startswith('..') or folder.startswith('/'):
-                 raise ValueError(f"Invalid folder path: {folder}")
-            
-            file_name = f"{resource['asset_id']}.{resource['format']}"
-            file_path = os.path.join(download_path, folder, file_name)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        print(f"🧵 Starting {self.download_workers} download workers for {total_resources} resources")
 
-            try:
-                response = requests.get(url, stream=True)
-                response.raise_for_status()
+        downloaded = 0
+        skipped = 0
+        failed = 0
 
-                with open(file_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size):
-                        f.write(chunk)
+        with ThreadPoolExecutor(max_workers=self.download_workers) as executor:
+            futures = [
+                executor.submit(self._download_resource_file, resource, download_path)
+                for resource in self.all_resources
+            ]
 
-                print(f"✅ Downloaded {file_name}")
+            for future in as_completed(futures):
+                status, file_name, details = future.result()
+                if status == "downloaded":
+                    downloaded += 1
+                    print(f"✅ Downloaded {file_name}")
+                elif status == "skipped":
+                    skipped += 1
+                    print(f"⏭️ Skipped {file_name}")
+                else:
+                    failed += 1
+                    print(f"❌ Failed {file_name}: {details}")
 
-            except requests.RequestException as e:
-                print(f"❌ Network error downloading {file_name}: {e}")
-            except IOError as e:
-                print(f"❌ Error saving {file_name}: {e}")
-            except Exception as e:
-                print(f"❌ Unexpected error downloading {file_name}: {type(e).__name__}: {e}")
+        print(
+            "📦 Download summary - "
+            f"downloaded: {downloaded}, skipped: {skipped}, failed: {failed}"
+        )
+
     def run(self):
         self.get_resources()
         self.scheduler.start()
